@@ -1,0 +1,311 @@
+\chapter{Case Study: Direct N-Body Simulation}
+\label{ch:cuda-nbody}
+
+The previous case studies focused on computations with dependencies between
+updates. An $N$-body simulation provides a different form of parallelism: at a
+given time step, the acceleration of each body can be computed independently
+from the current positions of all bodies. This gives a simple, useful example
+of an all-pairs computation on the GPU.
+
+This chapter starts with direct summation, in which every body interacts with
+every other body. It then improves the force calculation by loading source
+bodies into shared memory and reusing them across the threads of a block. The
+number of interactions remains $O(N^2)$; the optimization targets data reuse.
+The companion notebook, \lstinline|chapter07_nbody_direct_cuda.ipynb|,
+contains the complete CUDA program, a CPU reference, timing code, and a Python
+animation of the simulation.
+
+\begin{learningbox}
+The reader will learn:
+\begin{itemize}
+    \item how to map an all-pairs force calculation to one CUDA thread per
+          target body;
+    \item how to reuse source-body data with a shared-memory tile;
+    \item how to organize a Velocity-Verlet step as ordered CUDA kernels;
+    \item how to validate GPU results against a CPU reference;
+    \item how to measure force-kernel time separately from the complete
+          simulation and visualize the resulting motion.
+\end{itemize}
+\end{learningbox}
+
+\section{The Gravitational Model}
+\label{sec:nbody-model}
+
+Let body $i$ have position $\mathbf{x}_i$, velocity $\mathbf{v}_i$, and mass
+$m_i$. The acceleration of body $i$ due to all the other bodies is
+\begin{equation}
+\mathbf{a}_i = G \sum_{\substack{j=0\\j\ne i}}^{N-1} m_j
+\frac{\mathbf{x}_j-\mathbf{x}_i}
+     {\left(\|\mathbf{x}_j-\mathbf{x}_i\|^2+\varepsilon^2\right)^{3/2}}.
+\label{eq:nbody-force}
+\end{equation}
+The softening length $\varepsilon$ prevents the force from becoming singular
+when two bodies are very close. The notebook uses normalized units with
+$G=1$ and $\varepsilon=0.02$. Its initial configuration consists of a massive
+body at the center and a much lighter disk of bodies in the $xy$ plane. The
+force calculation itself is three-dimensional. Disk velocities are chosen to
+be approximately circular in the field of the central body; this is a
+teaching model, rather than a calibrated astrophysical system.
+
+The notebook advances the state with the Velocity-Verlet method. Given the
+position, velocity, and acceleration at time step $n$, first compute
+\begin{equation}
+\mathbf{x}_i^{n+1} = \mathbf{x}_i^n + \Delta t\,\mathbf{v}_i^n
+             + \frac{1}{2}\Delta t^2\mathbf{a}_i^n.
+\label{eq:nbody-position-update}
+\end{equation}
+The accelerations are then evaluated at the new positions, and the velocities
+are updated as
+\begin{equation}
+\mathbf{v}_i^{n+1} = \mathbf{v}_i^n +
+   \frac{\Delta t}{2}\left(\mathbf{a}_i^n+\mathbf{a}_i^{n+1}\right).
+\label{eq:nbody-velocity-update}
+\end{equation}
+This method requires two force evaluations for the first step (one to obtain
+the initial accelerations and one at the new positions) and one new force
+evaluation per subsequent step. The notebook initializes the first
+acceleration on the CPU, then keeps the evolving state on the GPU.
+
+For each target body, the force loop visits the other $N-1$ bodies. The total
+work per time step is therefore proportional to $N(N-1)$, or $O(N^2)$. The
+force on each target is an independent output, so there are no writes shared
+between target threads and no atomics are needed.
+
+\section{Body Data and CPU Reference}
+\label{sec:nbody-data}
+
+The CUDA program stores each body's position and mass together in a
+\lstinline|double4_16a| record: the \lstinline|x|, \lstinline|y|, and
+\lstinline|z| fields hold position, and \lstinline|w| holds mass. Velocity
+and acceleration are stored in separate arrays of the same record type; their
+fourth fields are unused. Neighboring CUDA threads process neighboring body
+indices, so their accesses to these arrays are adjacent. The explicit
+16-byte-aligned vector type avoids the deprecated \lstinline|double4| name in
+CUDA Toolkit 13 and later.
+
+A CPU implementation of the same force law and integrator provides a
+reference for validation. The GPU and CPU sum interactions in different
+orders, so their floating-point results need not be bitwise identical. The
+notebook compares the state after one step using a maximum absolute error and
+a tolerance of $10^{-9}$.
+
+\section{Direct Force Evaluation}
+\label{sec:nbody-naive}
+
+The baseline GPU kernel assigns one thread to each target body. The thread
+loads that body's position, loops over all source bodies, accumulates the
+three acceleration components, and writes one acceleration record. The
+integrator is kept separate from this force kernel so the same update kernels
+can be used with both force implementations. The CUDA source uses $G=1$ and
+a block size of 256:
+
+\begin{lstlisting}[language=C++]
+constexpr int BLOCK_SIZE = 256;
+constexpr double GRAVITATIONAL_CONSTANT = 1.0;
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption={Direct all-pairs acceleration: one thread computes the acceleration of one target body.},label={lst:nbody-naive}]
+__global__ void acceleration_global(
+    const double4_16a* __restrict__ position_mass,
+    double4_16a* __restrict__ acceleration,
+    int n,
+    double softening_squared)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const double4_16a target = position_mass[i];
+    double ax = 0.0, ay = 0.0, az = 0.0;
+
+    for (int j = 0; j < n; ++j) {
+        if (i == j) continue;
+        const double4_16a source = position_mass[j];
+        const double dx = source.x - target.x;
+        const double dy = source.y - target.y;
+        const double dz = source.z - target.z;
+        const double r2 = dx*dx + dy*dy + dz*dz + softening_squared;
+        const double inv_r = 1.0 / sqrt(r2);
+        const double scale = GRAVITATIONAL_CONSTANT * source.w * inv_r * inv_r * inv_r;
+        ax += scale * dx;
+        ay += scale * dy;
+        az += scale * dz;
+    }
+    acceleration[i] = make_double4_16a(ax, ay, az, 0.0);
+}
+\end{lstlisting}
+
+The bounds check handles the extra threads in the final block when $N$ is not
+a multiple of the block size. Each valid thread writes a distinct output
+index. At a given loop iteration, the lanes of a warp read the same source
+index $j$; the hardware caches may therefore capture some of the reuse even
+in this direct version. The tiled kernel makes reuse across a whole block
+explicit.
+
+\section{Reusing Source Bodies with Shared Memory}
+\label{sec:nbody-tiled}
+
+The tiled kernel also assigns one thread to each target body. At each loop
+iteration, however, the block cooperatively loads a contiguous tile of source
+records into shared memory. Every valid target thread uses that tile to
+accumulate part of its acceleration before the block loads the next tile.
+The notebook uses a block size of 256 and a statically sized shared-memory
+array.
+
+\begin{lstlisting}[language=C++,caption={Tiled all-pairs acceleration with shared-memory reuse.},label={lst:nbody-tiled}]
+__global__ void acceleration_tiled(
+    const double4_16a* __restrict__ position_mass,
+    double4_16a* __restrict__ acceleration,
+    int n,
+    double softening_squared)
+{
+    __shared__ double4_16a source_tile[BLOCK_SIZE];
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x;
+    double ax = 0.0, ay = 0.0, az = 0.0;
+    double4_16a target = make_double4_16a(0.0, 0.0, 0.0, 0.0);
+    if (i < n) target = position_mass[i];
+
+    const int tile_count_total = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    for (int tile = 0; tile < tile_count_total; ++tile) {
+        const int source_index = tile * BLOCK_SIZE + lane;
+        if (source_index < n)
+            source_tile[lane] = position_mass[source_index];
+        else
+            source_tile[lane] = make_double4_16a(0.0, 0.0, 0.0, 0.0);
+        __syncthreads();
+
+        const int count = min(BLOCK_SIZE, n - tile * BLOCK_SIZE);
+        if (i < n) {
+            for (int k = 0; k < count; ++k) {
+                const int j = tile * BLOCK_SIZE + k;
+                if (i == j) continue;
+                const double4_16a source = source_tile[k];
+                const double dx = source.x - target.x;
+                const double dy = source.y - target.y;
+                const double dz = source.z - target.z;
+                const double r2 = dx*dx + dy*dy + dz*dz
+                                  + softening_squared;
+                const double inv_r = 1.0 / sqrt(r2);
+                const double scale = GRAVITATIONAL_CONSTANT * source.w * inv_r * inv_r * inv_r;
+                ax += scale * dx;
+                ay += scale * dy;
+                az += scale * dz;
+            }
+        }
+        __syncthreads();
+    }
+    if (i < n)
+        acceleration[i] = make_double4_16a(ax, ay, az, 0.0);
+}
+\end{lstlisting}
+
+Both barriers must be reached by every thread in the block. The first makes
+the loaded tile available to the block; the second ensures that all target
+threads have finished reading it before any thread overwrites it with the
+next tile. Threads in a partially filled final block skip the force
+accumulation when their target index is invalid, but still participate in
+both barriers.
+
+A source tile of $B$ records is loaded once per block and reused by up to $B$
+target threads. This reduces repeated source loads at the block level, while
+the number of target--source interactions remains $O(N^2)$. The reduction in
+source-level loads does not translate directly into the same reduction in
+DRAM traffic: the direct kernel's same-index warp loads may be served
+efficiently by caches or broadcast behavior. The notebook therefore measures
+both versions on the available GPU rather than assuming that shared memory
+always wins.
+
+\section{A Velocity-Verlet Step on the GPU}
+\label{sec:nbody-device-loop}
+
+One time step is implemented as three ordered kernels:
+\begin{enumerate}
+    \item update all positions using the current velocities and accelerations;
+    \item compute new accelerations from the updated positions, using either
+          \lstinline|acceleration_global| or
+          \lstinline|acceleration_tiled|;
+    \item update all velocities and replace the stored accelerations by the
+          new values.
+\end{enumerate}
+The kernels are launched in the same CUDA stream. Their order provides the
+global ordering between these stages: the force kernel sees all updated
+positions, and the velocity kernel sees all new accelerations. No host-side
+synchronization is needed between steps. The evolving positions, velocities,
+and accelerations stay in device memory; the host copies positions back only
+when saving frames for the animation.
+
+\section{Validation, Timing, and Visualization}
+\label{sec:nbody-validation}
+
+The notebook first initializes a small system with $N=64$, computes one
+Velocity-Verlet step on the CPU, and compares it with one step using each GPU
+force kernel. The maximum absolute error is checked against $10^{-9}$. This
+checks both force implementations and the common integration stages.
+
+For timing, the notebook uses $N=2048$, performs three warm-up launches, and
+averages ten launches measured with CUDA events. Allocation and host-to-device
+transfer occur outside the timed interval, so the reported value is force
+kernel time per launch, not a full time step or an end-to-end simulation
+measurement. Results depend on the GPU, CUDA version, and runtime conditions;
+the notebook prints the measurements obtained on the reader's device.
+
+The animation uses the tiled kernel for $N=512$ bodies and 1200 time steps,
+with $\Delta t=0.001$. It saves the initial state and then one snapshot every
+10 steps, giving 121 frames. A short Python cell reads the positions and
+animates the disk and central body. Python is used only for visualization;
+the force calculation and time integration are written in CUDA C++.
+
+\begin{validationbox}[Common pitfalls]
+\begin{itemize}
+    \item Returning from a tiled kernel before a block-wide barrier. All
+          threads must reach both \lstinline|__syncthreads()| calls.
+    \item Omitting the second barrier, which may let a thread overwrite a
+          source tile while another thread is still using it.
+    \item Updating each body's position in the same kernel that computes
+          forces from positions that other threads are concurrently reading.
+          The notebook separates the position update and force evaluation
+          into ordered launches.
+    \item Setting the softening parameter to zero, which permits a singular
+          force for coincident bodies.
+    \item Treating one kernel's timing as the run time of the complete
+          multi-step simulation.
+\end{itemize}
+\end{validationbox}
+
+\section{Summary and Further Directions}
+\label{sec:nbody-summary}
+
+Direct summation exposes $N$ independent target calculations, each interacting
+with all $N$ sources. The baseline kernel assigns one thread to each target;
+the tiled kernel reuses source records in shared memory. Both perform
+$O(N^2)$ interactions. The Velocity-Verlet update is split into ordered GPU
+kernels, and the accompanying notebook validates the calculation, measures
+the force kernels, and animates the resulting motion.
+
+For much larger systems, treecodes and the fast multipole method (FMM) reduce
+the work by approximating interactions between sufficiently distant groups of
+bodies. They require additional data structures and algorithms, so they are
+outside the scope of this direct-method case study and may be treated as a
+later chapter or supplementary example.
+
+\begin{enumerate}
+\item For $N=1000$ and a block size $B=256$, how many target threads are
+      launched? How many source tiles are visited by each valid target?
+\item Why must invalid target threads in the final block still reach both
+      barriers in \lstinline|acceleration_tiled|?
+\item Shared-memory tiling reduces repeated source loads but does not change
+      the number of interactions. Explain why these statements are
+      compatible.
+\item Which parts of the program are included in the notebook's force-kernel
+      timing? What additional work would need to be measured for an
+      end-to-end simulation time?
+\end{enumerate}
+
+\section*{References}
+\addcontentsline{toc}{section}{References}
+\begin{enumerate}
+\item NVIDIA, \emph{CUDA C++ Programming Guide}, sections on vector types,
+      shared memory, and synchronization.
+\item NVIDIA, \emph{CUDA C++ Best Practices Guide}, sections on coalescing,
+      shared-memory reuse, and performance measurement.
+\end{enumerate}
